@@ -1,0 +1,74 @@
+# Builds the standalone DAP server from this fork and publishes it as a release
+# asset, so a machine can use it with one download instead of cloning this
+# repository and running a full npm install.
+#
+# Why this fork exists: upstream closed browser-extension debugging as
+# *out-of-scope (microsoft/vscode-js-debug#945), so mason and every other
+# distribution ship an adapter that cannot debug a Chrome extension. This branch
+# carries PR #2361 on top of upstream to get that support.
+#
+# The tarball's layout matches upstream's own js-debug-dap asset (dist/ contains
+# src/dapDebugServer.js plus bootloader/watchdog and resources), so it is a drop-in
+# replacement for what mason installs.
+name: webext release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.117.0-webext.1)'
+        required: true
+  push:
+    tags:
+      - 'v*-webext*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # Matches the node version upstream's own CI builds with.
+          node-version: '18'
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build the standalone DAP server
+        run: npx gulp dapDebugServer
+
+      - name: Verify the build carries the extension support
+        run: |
+          test -f dist/src/dapDebugServer.js
+          # Fail loudly rather than shipping a build that silently lacks the
+          # patch -- the whole point of this fork.
+          grep -q "extensionPath" dist/src/dapDebugServer.js
+          grep -q "wakeExtensionServiceWorker" dist/src/dapDebugServer.js
+          echo "ok: $(wc -c < dist/src/dapDebugServer.js) bytes"
+
+      - name: Package
+        run: tar -czf js-debug-dap-webext.tar.gz -C dist .
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          gh release create "$TAG" js-debug-dap-webext.tar.gz \
+            --title "$TAG" \
+            --notes "Standalone DAP server built from upstream $(node -p "require('./package.json').version") with microsoft/vscode-js-debug#2361 (WebExtension debugging) applied.
+
+          Install:
+
+              mkdir -p ~/.local/share/nvim/js-debug-webext
+              curl -L https://github.com/huiyu/vscode-js-debug/releases/latest/download/js-debug-dap-webext.tar.gz \\
+                | tar -xz -C ~/.local/share/nvim/js-debug-webext
+
+          The adapter entry point is then \`~/.local/share/nvim/js-debug-webext/src/dapDebugServer.js\`.
+          Layout matches upstream's own js-debug-dap asset, so it is a drop-in replacement for the one mason installs." \
+            || gh release upload "$TAG" js-debug-dap-webext.tar.gz --clobber

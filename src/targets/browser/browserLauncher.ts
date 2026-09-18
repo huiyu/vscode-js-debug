@@ -178,12 +178,17 @@ export abstract class BrowserLauncher<T extends AnyChromiumLaunchConfiguration>
     const effectiveRuntimeArgs = extensionPath
       ? [
         ...(runtimeArgs || []),
+        // Chrome 137+ ignores this switch; it is kept for older browsers, where
+        // it is the only way in. Newer ones are served by the CDP install in
+        // launchCdp, and installing twice is harmless -- loadUnpacked on the
+        // same path re-installs the same id, which is what the reloader relies
+        // on anyway.
         `--load-extension=${extensionPath}`,
-        // Allows Extensions.loadUnpacked, used to reload the extension when
-        // its files change. Only available over the pipe transport.
-        ...(this.usesPipeConnection(port, inspectUri)
-          ? ['--enable-unsafe-extension-debugging']
-          : []),
+        // Gates the Extensions domain. The protocol documents it as
+        // pipe-transport only, but Extensions.loadUnpacked was measured working
+        // over --remote-debugging-port as well, so pass it whenever an
+        // extension is in play rather than only for pipes.
+        '--enable-unsafe-extension-debugging',
       ]
       : runtimeArgs || [];
 
@@ -214,11 +219,6 @@ export abstract class BrowserLauncher<T extends AnyChromiumLaunchConfiguration>
         promisedPort,
       },
     );
-  }
-
-  /** Whether the browser will be launched with a pipe CDP transport. */
-  private usesPipeConnection(port: number | undefined, inspectUri: string | null | undefined) {
-    return !port && !inspectUri;
   }
 
   protected async getFilterForTarget(params: T) {
@@ -372,6 +372,21 @@ export abstract class BrowserLauncher<T extends AnyChromiumLaunchConfiguration>
     // browser to start it. Done after waitForMainTarget has subscribed so we
     // don't miss the target it creates.
     if (params.extensionPath) {
+      // Chrome removed --load-extension in 137, so the switch above installs
+      // nothing on a current browser and there would be no extension to attach
+      // to. Install over CDP instead. Best-effort: on an older browser the
+      // switch already did it and this is a no-op re-install, and on a browser
+      // without the Extensions domain we still have whatever the switch loaded.
+      try {
+        await cdp.rootSession().Extensions.loadUnpacked({ path: params.extensionPath });
+      } catch (e) {
+        this.logger.info(
+          LogTag.RuntimeLaunch,
+          'Could not install the extension over CDP; relying on --load-extension',
+          { extensionPath: params.extensionPath, error: e },
+        );
+      }
+
       const extensionId = await resolveExpectedExtensionId(params.extensionPath, this.fs);
       if (extensionId) {
         await this._targetManager.wakeExtensionServiceWorker(extensionId);
@@ -405,7 +420,7 @@ export abstract class BrowserLauncher<T extends AnyChromiumLaunchConfiguration>
     // re-installs from the same path (same ID), which also starts the new
     // service worker; the debugger then re-attaches through the normal
     // target-created flow. The method requires the pipe transport.
-    if (params.extensionPath && this.usesPipeConnection(params.port, params.inspectUri)) {
+    if (params.extensionPath) {
       const extensionPath = params.extensionPath;
       const rootSession = cdp.rootSession();
       this._extensionReloader?.dispose();
